@@ -4,8 +4,9 @@ import uuid
 from collections import defaultdict, deque
 from typing import Optional
 
-from fastapi import FastAPI, Header, HTTPException, Response
+from fastapi import FastAPI, Header, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
 
@@ -15,7 +16,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -40,7 +41,6 @@ idempotency_store = {}
 
 # -----------------------------
 # Rate Limiting
-# 16 requests / 10 seconds
 # -----------------------------
 WINDOW = 10
 LIMIT = 16
@@ -48,7 +48,7 @@ LIMIT = 16
 client_requests = defaultdict(deque)
 
 
-def check_rate_limit(client_id: str, response: Response):
+def check_rate_limit(client_id: str):
     now = time.time()
 
     dq = client_requests[client_id]
@@ -57,15 +57,18 @@ def check_rate_limit(client_id: str, response: Response):
         dq.popleft()
 
     if len(dq) >= LIMIT:
-        retry_after = int(WINDOW - (now - dq[0])) + 1
-        response.headers["Retry-After"] = str(retry_after)
-        raise HTTPException(
+        retry_after = max(1, int(dq[0] + WINDOW - now))
+
+        return JSONResponse(
             status_code=429,
-            detail="Rate limit exceeded",
-            headers={"Retry-After": str(retry_after)},
+            content={"detail": "Rate limit exceeded"},
+            headers={
+                "Retry-After": str(retry_after)
+            },
         )
 
     dq.append(now)
+    return None
 
 
 # -----------------------------
@@ -79,9 +82,7 @@ def decode_cursor(cursor: Optional[str]) -> int:
     if not cursor:
         return 0
     try:
-        return int(
-            base64.urlsafe_b64decode(cursor.encode()).decode()
-        )
+        return int(base64.urlsafe_b64decode(cursor.encode()).decode())
     except Exception:
         return 0
 
@@ -91,11 +92,12 @@ def decode_cursor(cursor: Optional[str]) -> int:
 # -----------------------------
 @app.post("/orders", status_code=201)
 def create_order(
-    response: Response,
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
     client_id: str = Header("default", alias="X-Client-Id"),
 ):
-    check_rate_limit(client_id, response)
+    limited = check_rate_limit(client_id)
+    if limited:
+        return limited
 
     if idempotency_key in idempotency_store:
         return idempotency_store[idempotency_key]
@@ -116,17 +118,17 @@ def create_order(
 def list_orders(
     limit: int = 10,
     cursor: Optional[str] = None,
-    response: Response = None,
     client_id: str = Header("default", alias="X-Client-Id"),
 ):
-    check_rate_limit(client_id, response)
+    limited = check_rate_limit(client_id)
+    if limited:
+        return limited
 
     start = decode_cursor(cursor)
 
     items = catalog[start:start + limit]
 
     next_cursor = None
-
     if start + limit < len(catalog):
         next_cursor = encode_cursor(start + limit)
 
